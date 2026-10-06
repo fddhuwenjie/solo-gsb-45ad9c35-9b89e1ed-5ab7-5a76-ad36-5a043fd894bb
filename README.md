@@ -9,8 +9,9 @@
 - **成绩更正**：更正后不再合格的"已认"互认原子地转为**待复核**，停止计分，但课程与要求两端的占用保留。
 - **复核**：成绩恢复后须显式复核才能重新计分；复核仍不合格则维持待复核。
 - **撤销**：删除互认记录，释放两端占用，之后可重新申请。
-- **查询**：`/progress` 区分已认（计分）、待复核（不计分但占用）、空缺。
-- **并发**：所有写操作在进程锁 + `BEGIN IMMEDIATE` 事务内串行执行，检查与写入原子完成，并发申请/更正/复核不会重复使用或暴露中间态。
+- **整批改派**：一次把多条**已认**互认改派到各自的目标要求（`POST /recognitions/reassign`）。按本批原占用**同时释放后**的状态核对：互认编号与目标要求在批内均不得重复、来源须是现存已认记录（待复核不可改派）、课程对目标要求的替代规则/当前成绩/当前学分均合格、目标要求未被批外的已认或待复核记录占用（两条记录互换要求不会相互冲突）。任一项不合格则**原互认与进度整批不变**；成功则保留原互认编号、更新要求与进度。
+- **查询**：`/progress` 区分已认（计分）、待复核（不计分但占用）、空缺；一次查询取同一提交快照，不会混出改派前后的结果。
+- **并发**：所有写操作（申请、成绩更正、复核、撤销、改派）在进程锁 + `BEGIN IMMEDIATE` 事务内串行执行，检查与写入原子完成，并发操作不会重复使用或暴露中间态；改派之后的操作一律按改派后的关系判断。
 
 ## 启动
 
@@ -67,6 +68,37 @@ curl -s -X POST localhost:8000/recognitions/1/review
 
 # 8. 撤销互认，释放课程与要求的占用
 curl -s -X DELETE localhost:8000/recognitions/1
+
+# 9. 整批改派：两门已认课程互换培养要求
+#    （逐条撤销再申请会暂时放出名额，互换还会因相互占用而失败；整批改派一次完成）
+#    下列编号独立，可在全新数据库上直接执行；互认编号以第 9 步批量互认返回的 id 为准
+curl -s -X POST localhost:8000/courses -H 'Content-Type: application/json' \
+  -d '{"id": "D1", "credits": 4, "score": 86}'
+curl -s -X POST localhost:8000/courses -H 'Content-Type: application/json' \
+  -d '{"id": "D2", "credits": 4, "score": 78}'
+curl -s -X POST localhost:8000/requirements -H 'Content-Type: application/json' \
+  -d '{"id": "RD1", "required_credits": 4}'
+curl -s -X POST localhost:8000/requirements -H 'Content-Type: application/json' \
+  -d '{"id": "RD2", "required_credits": 4}'
+curl -s -X POST localhost:8000/substitutions -H 'Content-Type: application/json' \
+  -d '{"course_id": "D1", "requirement_id": "RD1", "min_score": 60}'
+curl -s -X POST localhost:8000/substitutions -H 'Content-Type: application/json' \
+  -d '{"course_id": "D1", "requirement_id": "RD2", "min_score": 60}'
+curl -s -X POST localhost:8000/substitutions -H 'Content-Type: application/json' \
+  -d '{"course_id": "D2", "requirement_id": "RD1", "min_score": 60}'
+curl -s -X POST localhost:8000/substitutions -H 'Content-Type: application/json' \
+  -d '{"course_id": "D2", "requirement_id": "RD2", "min_score": 60}'
+curl -s -X POST localhost:8000/recognitions -H 'Content-Type: application/json' \
+  -d '{"items": [{"course_id": "D1", "requirement_id": "RD1"}, {"course_id": "D2", "requirement_id": "RD2"}]}'
+# 全新数据库上两条互认编号为 1、2（若跑过前面的示例则编号顺延，按实际 id 替换）
+curl -s -X POST localhost:8000/recognitions/reassign -H 'Content-Type: application/json' \
+  -d '{"items": [{"recognition_id": 1, "target_requirement_id": "RD2"}, {"recognition_id": 2, "target_requirement_id": "RD1"}]}'
+# -> {"reassigned":[{"id":1,"from_requirement_id":"RD1","to_requirement_id":"RD2"}, ...]}
+
+# 10. 目标要求被批外已认/待复核记录占用则整批拒绝（此时 RD1 由互认 2 占用）
+curl -s -X POST localhost:8000/recognitions/reassign -H 'Content-Type: application/json' \
+  -d '{"items": [{"recognition_id": 1, "target_requirement_id": "RD1"}]}'
+# -> 409, detail 说明 RD1 已被批外互认 2 占用；原互认与进度保持不变
 ```
 
 ## API 一览
@@ -82,6 +114,7 @@ curl -s -X DELETE localhost:8000/recognitions/1
 | GET | `/substitutions` | 规则列表 |
 | POST | `/recognitions` | 批量互认（整批确认或整批不写） |
 | GET | `/recognitions?status=confirmed\|pending` | 按状态查询互认 |
+| POST | `/recognitions/reassign` | 整批改派已认互认到新要求（整批成功或整批不变） |
 | POST | `/recognitions/{id}/review` | 复核待复核记录 |
 | DELETE | `/recognitions/{id}` | 撤销并释放占用 |
 | GET | `/progress` | 进度：已认/待复核/空缺与学分统计 |

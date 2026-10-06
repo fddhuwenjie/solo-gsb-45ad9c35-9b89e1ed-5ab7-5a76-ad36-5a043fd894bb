@@ -7,6 +7,9 @@
 - 成绩更正使互认不合格：转为"待复核"，停止计分，但两端占用保留。
 - 成绩恢复后须显式复核才能重新计分；复核仍不合格维持待复核；
   可撤销以释放占用。
+- 整批改派：把多条"已认"互认整体改派到各自的目标要求。按本批
+  原占用同时释放后的状态核对规则/成绩/学分与目标要求占用；任一项
+  不合格则整批保持原样，全部合格才更新要求与进度并保留原互认编号。
 """
 
 from __future__ import annotations
@@ -63,6 +66,15 @@ class RecognitionItem(BaseModel):
 
 class RecognitionBatchIn(BaseModel):
     items: List[RecognitionItem] = Field(min_length=1)
+
+
+class ReassignItem(BaseModel):
+    recognition_id: int = Field(gt=0)
+    target_requirement_id: str = Field(min_length=1, max_length=64)
+
+
+class ReassignBatchIn(BaseModel):
+    items: List[ReassignItem] = Field(min_length=1)
 
 
 # ---------------------------------------------------------------- helpers
@@ -348,6 +360,142 @@ def list_recognitions(
     return [_row_to_recognition(r) for r in rows]
 
 
+@app.post("/recognitions/reassign")
+def reassign_recognitions(batch: ReassignBatchIn):
+    """整批改派已认互认到新的培养要求。
+
+    - 互认编号、目标要求编号在本批内均不得重复；
+    - 来源必须是现存"已认"记录（待复核记录不能改派）；
+    - 按本批原占用"同时释放"后的状态核对：每条课程对目标要求的
+      替代规则、当前成绩与学分都须合格，目标要求不得被批外的
+      "已认/待复核"记录占用（因此两条记录互换要求不会互相冲突）；
+    - 任一项不合格则整批不写，原互认与进度保持不变；
+    - 全部合格则保留原互认编号，更新要求（及 updated_at），返回
+      编号、原要求与新要求。
+
+    与成绩更正、复核、互认申请/撤销共用 write_tx 进程锁，串行执行；
+    之后的操作一律按改派后的关系判断。
+    """
+    errors: List[str] = []
+    seen_recognitions, seen_targets = set(), set()
+    for i, item in enumerate(batch.items):
+        if item.recognition_id in seen_recognitions:
+            errors.append(
+                f"items[{i}]: recognition {item.recognition_id} duplicated in batch"
+            )
+        if item.target_requirement_id in seen_targets:
+            errors.append(
+                f"items[{i}]: target requirement "
+                f"{item.target_requirement_id!r} duplicated in batch"
+            )
+        seen_recognitions.add(item.recognition_id)
+        seen_targets.add(item.target_requirement_id)
+    if errors:
+        raise HTTPException(409, errors)
+
+    batch_ids = [item.recognition_id for item in batch.items]
+    placeholders = ",".join("?" for _ in batch_ids)
+
+    with db.write_tx() as conn:
+        originals: List[dict] = []
+        for i, item in enumerate(batch.items):
+            prefix = f"items[{i}]"
+            rec = conn.execute(
+                "SELECT id, course_id, requirement_id, status "
+                "FROM recognitions WHERE id = ?",
+                (item.recognition_id,),
+            ).fetchone()
+            if rec is None:
+                errors.append(
+                    f"{prefix}: recognition {item.recognition_id} not found"
+                )
+                continue
+            if rec["status"] != "confirmed":
+                errors.append(
+                    f"{prefix}: recognition {item.recognition_id} is "
+                    f"{rec['status']!r}, only 'confirmed' can be reassigned"
+                )
+                continue
+
+            req = conn.execute(
+                "SELECT required_credits FROM requirements WHERE id = ?",
+                (item.target_requirement_id,),
+            ).fetchone()
+            if req is None:
+                errors.append(
+                    f"{prefix}: requirement {item.target_requirement_id!r} not found"
+                )
+                continue
+            course = conn.execute(
+                "SELECT credits, score FROM external_courses WHERE id = ?",
+                (rec["course_id"],),
+            ).fetchone()
+            if course is None:  # 外键约束下理论上不会发生
+                errors.append(
+                    f"{prefix}: course {rec['course_id']!r} not found"
+                )
+                continue
+            rule = conn.execute(
+                "SELECT min_score FROM substitutions "
+                "WHERE course_id = ? AND requirement_id = ?",
+                (rec["course_id"], item.target_requirement_id),
+            ).fetchone()
+            if rule is None:
+                errors.append(
+                    f"{prefix}: no substitution rule for "
+                    f"({rec['course_id']!r}, {item.target_requirement_id!r})"
+                )
+            elif course["score"] < rule["min_score"]:
+                errors.append(
+                    f"{prefix}: course {rec['course_id']!r} score "
+                    f"{course['score']} < min_score {rule['min_score']}"
+                )
+            if course["credits"] < req["required_credits"]:
+                errors.append(
+                    f"{prefix}: course {rec['course_id']!r} credits "
+                    f"{course['credits']} < required {req['required_credits']}"
+                )
+
+            # 目标要求的占用核对按"本批原占用同时释放"后的状态：
+            # 占用者属于本批改派来源（将要让出）则不视为冲突，
+            # 批外的已认/待复核记录一律拒绝。
+            occupant = conn.execute(
+                "SELECT id, status FROM recognitions "
+                f"WHERE requirement_id = ? AND status IN ('confirmed', 'pending') "
+                f"AND id NOT IN ({placeholders})",
+                (item.target_requirement_id, *batch_ids),
+            ).fetchone()
+            if occupant is not None:
+                errors.append(
+                    f"{prefix}: target requirement "
+                    f"{item.target_requirement_id!r} already occupied by "
+                    f"recognition {occupant['id']} ({occupant['status']}) "
+                    "outside this batch"
+                )
+
+            originals.append(
+                {
+                    "id": item.recognition_id,
+                    "from_requirement_id": rec["requirement_id"],
+                    "to_requirement_id": item.target_requirement_id,
+                }
+            )
+
+        if errors:
+            # 抛出异常 -> write_tx 回滚，原互认与进度整批保持不变
+            raise HTTPException(409, errors)
+
+        reassigned = []
+        for target in originals:
+            conn.execute(
+                "UPDATE recognitions SET requirement_id = ?, "
+                "updated_at = datetime('now') WHERE id = ?",
+                (target["to_requirement_id"], target["id"]),
+            )
+            reassigned.append(target)
+    return {"reassigned": reassigned}
+
+
 @app.post("/recognitions/{recognition_id}/review")
 def review_recognition(recognition_id: int):
     """复核待复核记录：合格则重新计分（confirmed），仍不合格维持 pending。"""
@@ -402,10 +550,14 @@ def revoke_recognition(recognition_id: int):
 
 @app.get("/progress")
 def get_progress():
-    """培养要求进度：区分已认（计分）、待复核（不计分但占用）、空缺。"""
+    """培养要求进度：区分已认（计分）、待复核（不计分但占用）、空缺。
+
+    全部 SELECT 在同一个只读事务快照中完成，结果只对应某一次提交
+    状态，不会读到改派/更正"写到一半"的混合视图。
+    """
     requirements = []
     total = earned = 0
-    with db.read_conn() as conn:
+    with db.read_tx() as conn:
         reqs = conn.execute(
             "SELECT id, required_credits FROM requirements ORDER BY id"
         ).fetchall()
