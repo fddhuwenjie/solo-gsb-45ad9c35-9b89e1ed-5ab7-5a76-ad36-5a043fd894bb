@@ -7,6 +7,9 @@
 - 成绩更正使互认不合格：转为"待复核"，停止计分，但两端占用保留。
 - 成绩恢复后须显式复核才能重新计分；复核仍不合格维持待复核；
   可撤销以释放占用。
+- 整批改派：把"已认"记录改派到另一培养要求。按本批原占用同时
+  释放后的状态校验（批内可互换要求），任一不合格整批不变；
+  成功则保留原互认编号，仅更新要求。
 """
 
 from __future__ import annotations
@@ -63,6 +66,15 @@ class RecognitionItem(BaseModel):
 
 class RecognitionBatchIn(BaseModel):
     items: List[RecognitionItem] = Field(min_length=1)
+
+
+class ReassignItem(BaseModel):
+    recognition_id: int = Field(gt=0)
+    requirement_id: str = Field(min_length=1, max_length=64)
+
+
+class ReassignBatchIn(BaseModel):
+    items: List[ReassignItem] = Field(min_length=1)
 
 
 # ---------------------------------------------------------------- helpers
@@ -327,6 +339,130 @@ def submit_recognitions(batch: RecognitionBatchIn):
                 }
             )
     return {"created": created}
+
+
+@app.post("/recognitions/reassign")
+def reassign_recognitions(batch: ReassignBatchIn):
+    """整批改派：把"已认"记录改派到另一培养要求。
+
+    - 互认编号与目标要求在批内均不得重复；来源必须是"已认"记录，
+      待复核记录不能作为改派来源。
+    - 校验按"本批原占用同时释放后"的状态进行：批内两条记录互换要求
+      不会因相互占用而失败；目标要求若被批外"已认/待复核"记录占用则拒绝。
+    - 按当前成绩与学分核对各课程对目标要求的替代规则；任一不合格，
+      原互认与进度整批保持不变。
+    - 成功则保留原互认编号，仅更新要求，进度随即按新关系计算。
+    """
+    errors: List[str] = []
+    seen_ids, seen_targets = set(), set()
+    for i, item in enumerate(batch.items):
+        if item.recognition_id in seen_ids:
+            errors.append(
+                f"items[{i}]: recognition {item.recognition_id} duplicated in batch"
+            )
+        if item.requirement_id in seen_targets:
+            errors.append(
+                f"items[{i}]: requirement {item.requirement_id!r} duplicated in batch"
+            )
+        seen_ids.add(item.recognition_id)
+        seen_targets.add(item.requirement_id)
+    if errors:
+        raise HTTPException(409, errors)
+
+    with db.write_tx() as conn:
+        batch_ids = {item.recognition_id for item in batch.items}
+        sources = {}
+        for i, item in enumerate(batch.items):
+            rec = conn.execute(
+                "SELECT id, course_id, requirement_id, status "
+                "FROM recognitions WHERE id = ?",
+                (item.recognition_id,),
+            ).fetchone()
+            if rec is None:
+                errors.append(f"items[{i}]: recognition {item.recognition_id} not found")
+                continue
+            if rec["status"] != "confirmed":
+                errors.append(
+                    f"items[{i}]: recognition {item.recognition_id} is "
+                    f"{rec['status']!r}, only 'confirmed' can be reassigned"
+                )
+                continue
+            sources[item.recognition_id] = rec
+
+        # 目标要求不得被批外"已认/待复核"记录占用（批内占用视为已同时释放）
+        for i, item in enumerate(batch.items):
+            holder = conn.execute(
+                "SELECT id FROM recognitions WHERE requirement_id = ? "
+                "AND status IN ('confirmed', 'pending')",
+                (item.requirement_id,),
+            ).fetchone()
+            if holder is not None and holder["id"] not in batch_ids:
+                errors.append(
+                    f"items[{i}]: requirement {item.requirement_id!r} already "
+                    "occupied by an active recognition outside the batch"
+                )
+
+        # 按当前成绩/学分核对各课程对目标要求的替代规则
+        for i, item in enumerate(batch.items):
+            rec = sources.get(item.recognition_id)
+            if rec is None:
+                continue  # 来源已报错，跳过资格校验
+            req = conn.execute(
+                "SELECT required_credits FROM requirements WHERE id = ?",
+                (item.requirement_id,),
+            ).fetchone()
+            if req is None:
+                errors.append(
+                    f"items[{i}]: requirement {item.requirement_id!r} not found"
+                )
+                continue
+            rule = conn.execute(
+                "SELECT min_score FROM substitutions "
+                "WHERE course_id = ? AND requirement_id = ?",
+                (rec["course_id"], item.requirement_id),
+            ).fetchone()
+            if rule is None:
+                errors.append(
+                    f"items[{i}]: no substitution rule for "
+                    f"({rec['course_id']!r}, {item.requirement_id!r})"
+                )
+                continue
+            course = conn.execute(
+                "SELECT credits, score FROM external_courses WHERE id = ?",
+                (rec["course_id"],),
+            ).fetchone()
+            if course["credits"] < req["required_credits"]:
+                errors.append(
+                    f"items[{i}]: course {rec['course_id']!r} credits "
+                    f"{course['credits']} < required {req['required_credits']}"
+                )
+            if course["score"] < rule["min_score"]:
+                errors.append(
+                    f"items[{i}]: course {rec['course_id']!r} score "
+                    f"{course['score']} < min_score {rule['min_score']}"
+                )
+        if errors:
+            # 抛出异常 -> write_tx 回滚，原互认与进度整批保持不变
+            raise HTTPException(409, errors)
+
+        reassigned = []
+        for item in batch.items:
+            rec = sources[item.recognition_id]
+            conn.execute(
+                "UPDATE recognitions SET requirement_id = ?, "
+                "updated_at = datetime('now') WHERE id = ?",
+                (item.requirement_id, item.recognition_id),
+            )
+            reassigned.append(
+                {
+                    "id": rec["id"],
+                    "course_id": rec["course_id"],
+                    "from_requirement_id": rec["requirement_id"],
+                    "to_requirement_id": item.requirement_id,
+                    "status": "confirmed",
+                }
+            )
+    return {"reassigned": reassigned}
 
 
 @app.get("/recognitions")

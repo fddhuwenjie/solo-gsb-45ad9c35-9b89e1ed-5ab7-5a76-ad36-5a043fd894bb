@@ -268,6 +268,224 @@ def test_not_found_and_empty_batch(client):
     assert client.put("/courses/C1", json={}).status_code == 422
 
 
+# ------------------------------------------------------------ 整批改派
+
+
+def reassign_seed(client):
+    """rec1: C1->R1，rec2: C2->R2；R3 空缺；C3 未占用且可替代 R1/R3。"""
+    seed(
+        client,
+        courses=[("C1", 6, 90), ("C2", 6, 80), ("C3", 4, 90)],
+        requirements=[("R1", 4), ("R2", 6), ("R3", 3)],
+        rules=[
+            ("C1", "R1", 60), ("C1", "R2", 60), ("C1", "R3", 60),
+            ("C2", "R1", 60), ("C2", "R2", 60), ("C2", "R3", 60),
+            ("C3", "R1", 60), ("C3", "R3", 60),
+        ],
+    )
+    assert client.post(
+        "/recognitions",
+        json={"items": [
+            {"course_id": "C1", "requirement_id": "R1"},
+            {"course_id": "C2", "requirement_id": "R2"},
+        ]},
+    ).status_code == 201
+
+
+def test_reassign_updates_requirement_and_keeps_id(client):
+    reassign_seed(client)
+    resp = client.post(
+        "/recognitions/reassign",
+        json={"items": [{"recognition_id": 1, "requirement_id": "R3"}]},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["reassigned"] == [
+        {
+            "id": 1,
+            "course_id": "C1",
+            "from_requirement_id": "R1",
+            "to_requirement_id": "R3",
+            "status": "confirmed",
+        }
+    ]
+    recs = {r["id"]: r for r in client.get("/recognitions").json()}
+    assert recs[1]["requirement_id"] == "R3"
+    assert recs[1]["status"] == "confirmed"
+    progress = client.get("/progress").json()
+    by_req = {r["requirement_id"]: r for r in progress["requirements"]}
+    assert by_req["R1"]["status"] == "vacant"
+    assert by_req["R3"]["status"] == "confirmed"
+    assert by_req["R3"]["recognition_id"] == 1
+    assert progress["earned_credits"] == 6 + 3
+
+
+def test_reassign_swap_within_batch(client):
+    """批内两条记录互换要求：原占用同时释放，不会因相互占用而失败。"""
+    reassign_seed(client)
+    resp = client.post(
+        "/recognitions/reassign",
+        json={"items": [
+            {"recognition_id": 1, "requirement_id": "R2"},
+            {"recognition_id": 2, "requirement_id": "R1"},
+        ]},
+    )
+    assert resp.status_code == 200
+    swapped = {r["id"]: r for r in resp.json()["reassigned"]}
+    assert swapped[1]["from_requirement_id"] == "R1"
+    assert swapped[1]["to_requirement_id"] == "R2"
+    assert swapped[2]["from_requirement_id"] == "R2"
+    assert swapped[2]["to_requirement_id"] == "R1"
+
+    recs = {r["id"]: r for r in client.get("/recognitions").json()}
+    assert recs[1]["requirement_id"] == "R2"
+    assert recs[2]["requirement_id"] == "R1"
+    progress = client.get("/progress").json()
+    by_req = {r["requirement_id"]: r for r in progress["requirements"]}
+    assert by_req["R1"]["course_id"] == "C2"
+    assert by_req["R2"]["course_id"] == "C1"
+    assert progress["earned_credits"] == 10
+
+
+def test_reassign_all_or_nothing(client):
+    reassign_seed(client)
+    resp = client.post(
+        "/recognitions/reassign",
+        json={"items": [
+            {"recognition_id": 1, "requirement_id": "R3"},
+            {"recognition_id": 2, "requirement_id": "NOPE"},
+        ]},
+    )
+    assert resp.status_code == 409
+    # 整批不变：rec1 仍在 R1，进度不变
+    recs = {r["id"]: r for r in client.get("/recognitions").json()}
+    assert recs[1]["requirement_id"] == "R1"
+    assert recs[2]["requirement_id"] == "R2"
+    assert client.get("/progress").json()["earned_credits"] == 10
+
+
+def test_reassign_rejects_duplicates_empty_and_unknown(client):
+    reassign_seed(client)
+    assert client.post(
+        "/recognitions/reassign", json={"items": []}
+    ).status_code == 422
+    resp = client.post(
+        "/recognitions/reassign",
+        json={"items": [
+            {"recognition_id": 1, "requirement_id": "R3"},
+            {"recognition_id": 1, "requirement_id": "R2"},
+        ]},
+    )
+    assert resp.status_code == 409
+    resp = client.post(
+        "/recognitions/reassign",
+        json={"items": [
+            {"recognition_id": 1, "requirement_id": "R3"},
+            {"recognition_id": 2, "requirement_id": "R3"},
+        ]},
+    )
+    assert resp.status_code == 409
+    resp = client.post(
+        "/recognitions/reassign",
+        json={"items": [{"recognition_id": 99, "requirement_id": "R3"}]},
+    )
+    assert resp.status_code == 409
+    assert "not found" in resp.json()["detail"][0]
+    # 均未生效
+    recs = {r["id"]: r for r in client.get("/recognitions").json()}
+    assert recs[1]["requirement_id"] == "R1"
+    assert recs[2]["requirement_id"] == "R2"
+
+
+def test_reassign_rejects_pending_source_and_occupied_target(client):
+    reassign_seed(client)
+    # 目标被批外"已认"记录占用
+    resp = client.post(
+        "/recognitions/reassign",
+        json={"items": [{"recognition_id": 1, "requirement_id": "R2"}]},
+    )
+    assert resp.status_code == 409
+    assert "occupied" in resp.json()["detail"][0]
+
+    # 成绩更正使 rec1 转待复核
+    assert client.put("/courses/C1", json={"score": 50}).json()["moved_to_pending"] == [1]
+    # 待复核记录不能作为改派来源
+    resp = client.post(
+        "/recognitions/reassign",
+        json={"items": [{"recognition_id": 1, "requirement_id": "R3"}]},
+    )
+    assert resp.status_code == 409
+    assert "pending" in resp.json()["detail"][0]
+    # 目标被批外"待复核"记录占用同样拒绝
+    resp = client.post(
+        "/recognitions/reassign",
+        json={"items": [{"recognition_id": 2, "requirement_id": "R1"}]},
+    )
+    assert resp.status_code == 409
+    assert "occupied" in resp.json()["detail"][0]
+    # 状态保持不变
+    recs = {r["id"]: r for r in client.get("/recognitions").json()}
+    assert recs[1]["requirement_id"] == "R1"
+    assert recs[1]["status"] == "pending"
+    assert recs[2]["requirement_id"] == "R2"
+
+
+def test_reassign_validates_rule_score_and_credits(client):
+    seed(
+        client,
+        courses=[("C1", 4, 70)],
+        requirements=[("R1", 4), ("R2", 4), ("R3", 5)],
+        rules=[("C1", "R1", 60), ("C1", "R3", 80)],  # C1->R2 无规则
+    )
+    client.post(
+        "/recognitions", json={"items": [{"course_id": "C1", "requirement_id": "R1"}]}
+    )
+
+    resp = client.post(
+        "/recognitions/reassign",
+        json={"items": [{"recognition_id": 1, "requirement_id": "R2"}]},
+    )
+    assert resp.status_code == 409
+    assert "no substitution rule" in resp.json()["detail"][0]
+
+    resp = client.post(
+        "/recognitions/reassign",
+        json={"items": [{"recognition_id": 1, "requirement_id": "R3"}]},
+    )
+    assert resp.status_code == 409
+    detail = " ".join(resp.json()["detail"])
+    assert "credits" in detail and "min_score" in detail
+
+    rec = client.get("/recognitions").json()[0]
+    assert rec["requirement_id"] == "R1"
+    assert client.get("/progress").json()["earned_credits"] == 4
+
+
+def test_operations_after_reassign_use_new_relations(client):
+    """后续操作按改派后的关系判断：原要求已释放、新要求被占用。"""
+    reassign_seed(client)
+    assert client.post(
+        "/recognitions/reassign",
+        json={"items": [{"recognition_id": 1, "requirement_id": "R3"}]},
+    ).status_code == 200
+
+    # R3 现被 rec1 占用；R1 已释放
+    resp = client.post(
+        "/recognitions", json={"items": [{"course_id": "C3", "requirement_id": "R3"}]}
+    )
+    assert resp.status_code == 409
+    resp = client.post(
+        "/recognitions", json={"items": [{"course_id": "C3", "requirement_id": "R1"}]}
+    )
+    assert resp.status_code == 201
+
+    # 更正也按新关系作用：C1 不达标 -> rec1 在其新要求 R3 上转待复核
+    moved = client.put("/courses/C1", json={"score": 50}).json()["moved_to_pending"]
+    assert moved == [1]
+    by_req = {r["requirement_id"]: r for r in client.get("/progress").json()["requirements"]}
+    assert by_req["R3"]["status"] == "pending"
+    assert by_req["R3"]["recognition_id"] == 1
+
+
 # ------------------------------------------------------------ 并发
 
 
@@ -318,8 +536,79 @@ def test_concurrent_correction_and_submit_consistent(client):
     assert len([r for r in recs if r["requirement_id"] == "R1"]) == 1
 
 
-# ------------------------------------------------------------ 持久化
+def test_concurrent_reassign_and_correction_serialized(client):
+    """改派与更正串行：改派成功当且仅当它排在首次更正之前。"""
+    reassign_seed(client)
 
+    def reassign(_):
+        with TestClient(app) as c:
+            return c.post(
+                "/recognitions/reassign",
+                json={"items": [{"recognition_id": 1, "requirement_id": "R3"}]},
+            ).status_code
+
+    def correct(_):
+        with TestClient(app) as c:
+            return c.put("/courses/C1", json={"score": 50}).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = [
+            ex.submit(reassign if i % 2 == 0 else correct, i) for i in range(20)
+        ]
+    reassign_codes = [futures[i].result() for i in range(0, 20, 2)]
+    correct_codes = [futures[i].result() for i in range(1, 20, 2)]
+
+    assert all(code == 200 for code in correct_codes)
+    assert all(code in (200, 409) for code in reassign_codes)
+
+    recs = client.get("/recognitions").json()
+    assert len(recs) == 2
+    by_id = {r["id"]: r for r in recs}
+    # 更正必然执行过：rec1 转待复核；其要求取决于改派是否抢先成功
+    assert by_id[1]["status"] == "pending"
+    reassign_succeeded = 200 in reassign_codes
+    assert by_id[1]["requirement_id"] == ("R3" if reassign_succeeded else "R1")
+    assert by_id[2]["status"] == "confirmed"
+    assert client.get("/progress").json()["earned_credits"] == 6
+
+
+def test_progress_snapshot_consistent_under_concurrent_reassign(client):
+    """进度查询取自同一提交快照：并发互换改派时不得读出混合状态。"""
+    reassign_seed(client)
+    failures = []
+
+    def swap(_):
+        with TestClient(app) as c:
+            for _ in range(15):
+                c.post("/recognitions/reassign", json={"items": [
+                    {"recognition_id": 1, "requirement_id": "R2"},
+                    {"recognition_id": 2, "requirement_id": "R1"},
+                ]})
+                c.post("/recognitions/reassign", json={"items": [
+                    {"recognition_id": 1, "requirement_id": "R1"},
+                    {"recognition_id": 2, "requirement_id": "R2"},
+                ]})
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        futs = [ex.submit(swap, i) for i in range(2)]
+        for _ in range(300):
+            progress = client.get("/progress").json()
+            by_req = {r["requirement_id"]: r for r in progress["requirements"]}
+            r1, r2 = by_req["R1"], by_req["R2"]
+            # 任一提交状态下：R1/R2 各被一条已认占用、课程不同、已得学分恒为 10
+            if not (
+                r1["status"] == "confirmed"
+                and r2["status"] == "confirmed"
+                and r1["course_id"] != r2["course_id"]
+                and progress["earned_credits"] == 10
+            ):
+                failures.append(progress)
+        for f in futs:
+            f.result()
+    assert not failures
+
+
+# ------------------------------------------------------------ 持久化
 
 def test_records_survive_restart(client, tmp_path, monkeypatch):
     base_seed(client)

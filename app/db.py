@@ -3,9 +3,11 @@
 并发模型：
 - 所有写操作通过 ``write_tx`` 进入，先取进程级可重入锁，再以
   ``BEGIN IMMEDIATE`` 开启事务（立即持有 SQLite 写锁），因此
-  "检查冲突 -> 写入" 是原子的，并发申请/更正/复核不会交错，
+  "检查冲突 -> 写入" 是原子的，并发申请/更正/复核/改派不会交错，
   不会出现重复使用或中间态。
-- 读操作使用独立连接，WAL 模式下读写互不阻塞。
+- 读操作使用独立连接并包裹在读事务中，WAL 模式下读写互不阻塞，
+  且同一次查询的所有 SELECT 取自同一提交快照，不会混合
+  并发写入（如改派）提交前后的结果。
 """
 
 from __future__ import annotations
@@ -93,8 +95,19 @@ def write_tx() -> Iterator[sqlite3.Connection]:
 
 @contextmanager
 def read_conn() -> Iterator[sqlite3.Connection]:
+    """读事务：同一上下文内的所有查询取自同一 WAL 快照。
+
+    自动提交模式下每条 SELECT 各自取快照，多步查询（如 /progress）
+    可能混入并发写入提交前后的状态；显式读事务把快照固定到事务结束。
+    """
     conn = connect()
     try:
-        yield conn
+        conn.execute("BEGIN DEFERRED")
+        try:
+            yield conn
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
     finally:
         conn.close()
